@@ -107,7 +107,7 @@ Every call is logged locally. You get an alert if quality drops below threshold.
 ## Setup
 
 ```bash
-git clone https://github.com/yourusername/ragprobe
+git clone https://github.com/RohanS1202/ragprobe
 cd ragprobe
 pip install -e ".[dev]"
 cp .env.example .env   # add your OpenAI key
@@ -134,4 +134,4 @@ PRs welcome. If you find a failure mode this doesn't catch, open an issue.
 
 ---
 
-MIT License
+Apache-2.0 License
