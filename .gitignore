@@ -1,0 +1,14 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+.ragprobe/
+*.db
+.DS_Store
+.venv/
+venv/
+examples/sec_eval_results.json
