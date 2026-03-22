@@ -5,26 +5,47 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ragprobe"
 version = "0.1.0"
-description = "Adversarial testing and evaluation for RAG pipelines and LLM agents"
+description = "Adversarial testing and evaluation framework for RAG pipelines and LLM agents"
 readme = "README.md"
-requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
-keywords = ["RAG", "LLM", "evaluation", "testing", "AI", "agents"]
+requires-python = ">=3.10"
+authors = [{ name = "Rohan Sagvekar" }]
+keywords = ["rag", "llm", "evaluation", "testing", "adversarial", "prompt-injection"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Testing",
+]
 dependencies = [
-    "openai>=1.0.0",
-    "anthropic>=0.20.0",
-    "pydantic>=2.0.0",
-    "rich>=13.0.0",
-    "python-dotenv>=1.0.0",
-    "numpy>=1.24.0",
-    "typer>=0.9.0",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "pytest-asyncio", "black", "ruff"]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "pydantic>=2.0.0",
+]
+openai = [
+    "openai>=1.0",
+]
 
 [project.scripts]
-ragprobe = "ragprobe.cli:app"
+ragprobe = "ragprobe.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/rohanvinayaksagvekar/ragprobe"
+Issues = "https://github.com/rohanvinayaksagvekar/ragprobe/issues"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--tb=short"
 
 [tool.setuptools.packages.find]
 where = ["."]

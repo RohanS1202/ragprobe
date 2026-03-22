@@ -1,95 +1,297 @@
 """
-evaluator.py — High-level API that ties generator + scorer together.
+evaluator.py — Integration core for ragprobe.
+
+Wires SafetyGate, RetrievalDiagnostic, and SessionReport into a single
+Evaluator class that the CLI calls and end users can use directly from Python.
+
+Usage::
+
+    from ragprobe import Evaluator, SafetyGate, RetrievalDiagnostic
+
+    gate       = SafetyGate.default(budget_usd=1.0)
+    diagnostic = RetrievalDiagnostic()
+    evaluator  = Evaluator(gate=gate, diagnostic=diagnostic, model="gpt-4o-mini")
+
+    report = evaluator.run(
+        queries   = ["What was Apple revenue in FY2024?"],
+        corpus    = [...],                 # raw document strings
+        references= ["Apple revenue was $391B in FY2024."],
+    )
+    report.save("results.json")
 """
 
 from __future__ import annotations
 
-from typing import Callable, Optional
+import logging
+import re
+from dataclasses import dataclass
+from typing import Any, Optional
 
-from ragprobe.core.generator import TestGenerator, TestCase, TestSuite, AttackType
-from ragprobe.core.scorer    import Scorer, EvalResult, EvalSummary
+from ragprobe.safety import SafetyGate
+from ragprobe.retrieval import RetrievalDiagnostic
+from ragprobe.reporter import SessionReport
+from ragprobe.core.cost_guard import BudgetExceededError
+from ragprobe.core.rate_limiter import RateLimitExceededError
+from ragprobe.core.injection_guard import InjectionDetectedError
+
+logger = logging.getLogger(__name__)
+
+# ── Exceptions caught as safety events (never allowed to crash a run) ─────────
+_SAFETY_EXCEPTIONS = (BudgetExceededError, RateLimitExceededError, InjectionDetectedError)
+
+# ── Stopwords (same set as retrieval.py — kept local to avoid coupling) ───────
+_STOPWORDS: frozenset[str] = frozenset({
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "shall", "can", "to", "of", "in", "for",
+    "on", "with", "at", "by", "from", "as", "or", "and", "but", "if",
+    "this", "that", "it", "its", "not", "no", "so", "what", "which",
+    "who", "how", "when", "where", "why", "i", "we", "you", "he", "she",
+    "they", "me", "us", "him", "her", "them", "my", "your", "his", "their",
+    "our", "than", "then", "there", "here", "up", "about", "any", "all",
+    "each", "few", "more", "most", "some", "such", "other", "both", "nor",
+    "neither", "either", "these", "those", "also", "into", "over", "after",
+    "between", "during", "before", "under", "while", "per", "only", "just",
+    "very", "too", "yet", "still", "already", "even",
+})
 
 
-class RAGEvaluator:
+def _tokenize(text: str) -> set[str]:
+    """Significant token set: lowercase, length >= 2, not a stopword."""
+    return {
+        t for t in re.findall(r"[a-z0-9]+", text.lower())
+        if len(t) >= 2 and t not in _STOPWORDS
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Evaluator
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class Evaluator:
     """
-    High-level evaluator for RAG pipelines.
+    Integration core: wires SafetyGate, RetrievalDiagnostic, and SessionReport.
 
-    Combines test generation and scoring in one clean interface.
+    Parameters
+    ----------
+    gate : SafetyGate
+        Safety gate used for corpus scanning and query validation.
+    diagnostic : RetrievalDiagnostic
+        Diagnostic engine used for recall, redundancy, and coverage scoring.
+    model : str
+        LLM model name recorded in the output SessionReport and used for cost
+        estimation.  Default: ``"gpt-4o-mini"``.
 
-    Args:
-        judge:      "openai" | "anthropic"
-        model:      specific model string (optional)
-        thresholds: dict of metric -> pass/fail threshold
-        api_key:    API key (reads from env if not provided)
+    Usage::
 
-    Example:
-        evaluator = RAGEvaluator(judge="openai")
-
-        suite = evaluator.generate_tests(
-            documents=my_chunks,
-            n_cases=30,
+        evaluator = Evaluator(
+            gate       = SafetyGate.default(budget_usd=2.0),
+            diagnostic = RetrievalDiagnostic(),
         )
-
-        results = evaluator.evaluate(
-            pipeline=my_rag_fn,
-            test_suite=suite,
-        )
-
-        evaluator.print_summary(results)
+        report = evaluator.run(queries, corpus, references)
     """
 
-    def __init__(
-        self,
-        judge:      str = "openai",
-        model:      Optional[str] = None,
-        thresholds: Optional[dict[str, float]] = None,
-        api_key:    Optional[str] = None,
-    ):
-        self.judge   = judge
-        self.model   = model
-        self.api_key = api_key
+    gate:       SafetyGate
+    diagnostic: RetrievalDiagnostic
+    model:      str = "gpt-4o-mini"
 
-        self._generator = TestGenerator(judge=judge, model=model, api_key=api_key)
-        self._scorer    = Scorer(judge=judge, model=model,
-                                 thresholds=thresholds, api_key=api_key)
+    # ── Public API ────────────────────────────────────────────────────────────
 
-    def generate_tests(
+    def run(
         self,
-        documents:    list[str],
-        n_cases:      int = 20,
-        attack_types: Optional[list[AttackType]] = None,
-        suite_name:   str = "eval_suite",
-    ) -> TestSuite:
-        """Generate adversarial test cases from your document corpus."""
-        return self._generator.generate(
-            documents    = documents,
-            n_cases      = n_cases,
-            attack_types = attack_types,
-            suite_name   = suite_name,
+        queries:         list[str],
+        corpus:          list[str],
+        references:      Optional[list[str]] = None,
+        *,
+        semantic_recall: bool = False,
+        client:          Any  = None,
+    ) -> SessionReport:
+        """
+        Run the full ragprobe evaluation pipeline.
+
+        Execution order
+        ---------------
+        1. ``gate.check_corpus(corpus)``  — validate and scan the full corpus.
+        2. For each query:
+           a. ``gate.check_query(query)`` — validate + injection scan.
+           b. ``top_k_retrieve(query, clean_corpus)`` — lexical top-5 retrieval.
+           c. ``gate.record_usage(prompt_tokens=approx)`` — track cost.
+        3. ``diagnostic.run(all_queries, all_chunks, references)`` — score
+           retrieval across the full query set and produce findings.
+        4. Pack everything into a ``SessionReport`` and return.
+
+        Any ``BudgetExceededError``, ``RateLimitExceededError``, or
+        ``InjectionDetectedError`` raised during per-query processing is logged
+        and appended to ``safety_events`` — it never crashes the run.
+
+        Parameters
+        ----------
+        queries : list[str]
+            User queries to evaluate.
+        corpus : list[str]
+            Raw document strings forming the retrieval corpus.
+        references : list[str] | None
+            Ground-truth reference answers (one per query).  When ``None``,
+            recall scores default to ``0.0`` in the returned report.
+        semantic_recall : bool
+            When ``True``, compute semantic recall using embedding cosine
+            similarity.  Requires ``client``.
+        client : Any
+            OpenAI-compatible embedding client.  Only needed when
+            ``semantic_recall=True``.
+
+        Returns
+        -------
+        SessionReport
+        """
+        safety_events: list[dict] = []
+
+        # ── 1. Corpus safety gate ─────────────────────────────────────────────
+        try:
+            clean_corpus, corpus_report = self.gate.check_corpus(corpus)
+        except Exception as exc:
+            logger.error("corpus check failed: %s", exc)
+            clean_corpus  = list(corpus)
+            corpus_report = {
+                "original_count": len(corpus), "clean_count": len(corpus),
+                "validation_errors": [], "injection_flagged": 0,
+                "injection_blocked": 0, "injection_risk": "SAFE",
+            }
+
+        if corpus_report["injection_flagged"] > 0:
+            safety_events.append({
+                "type":              "corpus_scan",
+                "document_index":    "",
+                "pattern":           "injection_pattern",
+                "risk_level":        corpus_report["injection_risk"],
+                "message": (
+                    f"{corpus_report['injection_flagged']} document(s) contained "
+                    "injection patterns; "
+                    f"{corpus_report['injection_blocked']} blocked before evaluation."
+                ),
+            })
+
+        # ── 2. Per-query retrieval ────────────────────────────────────────────
+        retrieved_per_query: list[list[str]] = []
+
+        for i, query in enumerate(queries):
+            try:
+                q_report = self.gate.check_query(query)
+                if not q_report["is_valid"]:
+                    safety_events.append({
+                        "type":           "query_validation",
+                        "document_index": i,
+                        "pattern":        ", ".join(q_report.get("injection_matches", [])),
+                        "risk_level":     q_report["injection_risk"],
+                        "message":        "; ".join(q_report["validation_errors"]),
+                    })
+
+                chunks = self.top_k_retrieve(query, clean_corpus)
+                retrieved_per_query.append(chunks)
+
+                # Approximate token usage: query * 4 + chunk words
+                approx_tokens = (
+                    len(query.split()) * 4
+                    + sum(len(c.split()) for c in chunks)
+                )
+                self.gate.record_usage(
+                    prompt_tokens=approx_tokens,
+                    model=self.model,
+                )
+
+            except _SAFETY_EXCEPTIONS as exc:
+                logger.warning("Safety event at query %d: %s", i, exc)
+                safety_events.append({
+                    "type":           type(exc).__name__,
+                    "document_index": i,
+                    "pattern":        "",
+                    "risk_level":     "HIGH",
+                    "message":        str(exc),
+                })
+                retrieved_per_query.append([])
+
+        # ── 3. Full diagnostic ────────────────────────────────────────────────
+        try:
+            diag = self.diagnostic.run(
+                queries,
+                retrieved_per_query,
+                references,
+                semantic_recall=semantic_recall,
+                client=client,
+            )
+        except Exception as exc:
+            logger.error("diagnostic run failed: %s", exc)
+            diag = {
+                "per_query": [
+                    {"query": q, "chunk_count": len(retrieved_per_query[i])}
+                    for i, q in enumerate(queries)
+                ],
+                "aggregate": {},
+                "findings":  [],
+            }
+
+        per_query = diag["per_query"]
+        aggregate = diag["aggregate"]
+        findings  = diag["findings"]
+
+        # Ensure mean_recall is always present (defaults 0.0 when no references)
+        aggregate.setdefault("mean_recall", 0.0)
+        for pq in per_query:
+            pq.setdefault("recall", 0.0)
+
+        # ── 4. Pack into SessionReport ────────────────────────────────────────
+        cost_sum = self.gate.cost_summary()
+
+        return SessionReport.new(
+            model              = self.model,
+            total_queries      = len(queries),
+            cost_summary       = cost_sum,
+            retrieval_findings = findings,
+            per_query          = per_query,
+            aggregate          = aggregate,
+            safety_events      = safety_events,
         )
 
-    def evaluate(
-        self,
-        pipeline:   Callable[[str], tuple[str, list[str]]],
-        test_suite: TestSuite,
-        metrics:    Optional[list[str]] = None,
-    ) -> list[EvalResult]:
+    # ── Default retriever ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def top_k_retrieve(query: str, corpus: list[str], k: int = 5) -> list[str]:
         """
-        Run the pipeline on every test case and score each output.
+        Lexical top-k retrieval using token overlap scoring.
 
-        Args:
-            pipeline:   fn(query: str) -> (answer: str, contexts: list[str])
-            test_suite: output of generate_tests()
-            metrics:    which metrics to score (default: all three)
+        Each corpus chunk is scored by the fraction of significant query tokens
+        it contains.  Chunks are returned in descending score order.
+
+        This is the default retriever.  Users can swap in their own by
+        subclassing ``Evaluator`` and overriding this method.
+
+        Parameters
+        ----------
+        query : str
+            The user query.
+        corpus : list[str]
+            Document strings to search.
+        k : int
+            Maximum number of chunks to return.  Default: 5.
+
+        Returns
+        -------
+        list[str]
+            Up to *k* chunks most relevant to *query*.
         """
-        return self._scorer.score_batch(
-            pipeline   = pipeline,
-            test_cases = test_suite.cases,
-            metrics    = metrics,
-        )
+        if not corpus:
+            return []
 
-    def summarise(self, results: list[EvalResult]) -> EvalSummary:
-        return self._scorer.summarise(results)
+        query_tokens = _tokenize(query)
+        if not query_tokens:
+            return list(corpus[:k])
 
-    def print_summary(self, results: list[EvalResult]) -> None:
-        self._scorer.print_summary(results)
+        scored: list[tuple[float, str]] = []
+        for chunk in corpus:
+            chunk_tokens = _tokenize(chunk)
+            score = len(query_tokens & chunk_tokens) / len(query_tokens)
+            scored.append((score, chunk))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [chunk for _, chunk in scored[:k]]

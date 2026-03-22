@@ -1,137 +1,216 @@
-# ragprobe 🔍
+# ragprobe
 
-**Adversarial testing and evaluation for RAG pipelines and LLM agents.**
+[![PyPI version](https://img.shields.io/pypi/v/ragprobe.svg)](https://pypi.org/project/ragprobe/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
+[![CI](https://github.com/rohanvinayaksagvekar/ragprobe/actions/workflows/ci.yml/badge.svg)](https://github.com/rohanvinayaksagvekar/ragprobe/actions)
 
-Stop shipping AI systems that fail silently. ragprobe automatically generates
-adversarial test cases from your documents and scores your pipeline on
-faithfulness, relevance, and retrieval quality.
+**Adversarial testing and evaluation framework for RAG pipelines and LLM agents.**
+
+ragprobe diagnoses the four things that break RAG systems in production: prompt injection in your document corpus, retrieval quality gaps (low recall, redundant chunks, poor coverage), runaway API costs, and unsafe query inputs. Most checks are purely lexical — no LLM call required.
+
+---
+
+## Install
 
 ```bash
 pip install ragprobe
 ```
 
----
-
-## The problem
-
-Your RAG assistant works great on happy-path tests. Then in production it
-confidently makes up numbers, answers the wrong question, or retrieves the
-wrong chunks — and nobody notices until something goes wrong.
-
-ragprobe gives you a testing track before you ship, and monitoring once you're live.
-
----
-
-## Quick start
-
-```python
-from ragprobe import RAGEvaluator
-
-evaluator = RAGEvaluator(judge="openai")  # or "anthropic"
-
-# Step 1: auto-generate adversarial test cases from your docs
-suite = evaluator.generate_tests(
-    documents=my_chunks,   # list of text strings
-    n_cases=30,
-)
-
-# Step 2: run your pipeline and score the outputs
-results = evaluator.evaluate(
-    pipeline=my_rag_fn,    # fn(query: str) -> (answer: str, contexts: list[str])
-    test_suite=suite,
-)
-
-# Step 3: see what broke
-evaluator.print_summary(results)
-```
-
-**Terminal output:**
-```
-ragprobe evaluation summary
-
- Metric            Score   Status
- Faithfulness       0.71    ✗
- Relevance          0.88    ✓
- Context recall     0.65    ✗
-
-Pass rate: 14/30 (47%)
-
-Failures by attack type:
-  negation             6 failures
-  out_of_scope         4 failures
-```
-
----
-
-## Production monitoring
-
-One decorator, zero changes to existing code:
-
-```python
-from ragprobe import monitor
-
-@monitor(project="my-rag-app", alert_threshold=0.75)
-def my_rag_pipeline(query: str) -> tuple[str, list]:
-    answer   = llm.generate(query)
-    contexts = retriever.get(query)
-    return answer, contexts
-```
-
-Every call is logged locally. You get an alert if quality drops below threshold.
-
----
-
-## Attack types
-
-| Type | What it tests |
-|---|---|
-| `negation` | Questions where the correct answer contradicts naive assumptions |
-| `out_of_scope` | Plausible questions your corpus can't answer (should say "I don't know") |
-| `ambiguous` | Questions with multiple valid interpretations |
-| `conflicting` | Questions where different chunks give different answers |
-| `edge_case` | Exact dates, numbers, names — high hallucination risk |
-| `hypothetical` | Reasoning questions that go beyond the documents |
-
----
-
-## Metrics
-
-| Metric | What it measures |
-|---|---|
-| `faithfulness` | Is every claim in the answer supported by retrieved context? |
-| `relevance` | Does the answer directly address what was asked? |
-| `context_recall` | Did the retriever surface the chunks needed to answer? |
-
----
-
-## Setup
+For semantic recall scoring using embeddings:
 
 ```bash
-git clone https://github.com/RohanS1202/ragprobe
-cd ragprobe
-pip install -e ".[dev]"
-cp .env.example .env   # add your OpenAI key
-python examples/demo.py
+pip install ragprobe[openai]
 ```
 
 ---
 
-## Roadmap
+## Quickstart (Python API)
 
-- [x] Adversarial test case generation
-- [x] LLM-as-judge scoring (faithfulness, relevance, context recall)
-- [x] Production monitoring decorator
-- [ ] Web dashboard (score trends, trace history)
-- [ ] Regression testing CI/CD integration
-- [ ] Slack / email alerts
-- [ ] Custom judge rubrics
+```python
+from ragprobe import Evaluator, SafetyGate, RetrievalDiagnostic, ReporterFactory
+
+# Your raw document corpus (strings)
+corpus = [
+    "Apple reported annual revenue of $391B for fiscal year 2024, up 4% YoY.",
+    "NVIDIA gross margin expanded from 57% in FY2023 to 73% in FY2024.",
+    "Microsoft cloud revenue reached $135B in FY2024, with Azure up 29%.",
+    # ... more documents
+]
+
+queries = [
+    "What was Apple total revenue in FY2024?",
+    "How did NVIDIA gross margin change year over year?",
+]
+
+references = [
+    "Apple revenue was $391B in FY2024, up 4%.",
+    "NVIDIA gross margin expanded from 57% to 73% in FY2024.",
+]
+
+# Wire the pipeline
+gate       = SafetyGate.default(budget_usd=1.0)
+diagnostic = RetrievalDiagnostic()
+evaluator  = Evaluator(gate=gate, diagnostic=diagnostic, model="gpt-4o-mini")
+
+# Run evaluation
+report = evaluator.run(queries=queries, corpus=corpus, references=references)
+
+# Inspect results
+print(f"Mean recall:     {report.aggregate['mean_recall']:.3f}")
+print(f"Mean redundancy: {report.aggregate['mean_redundancy']:.3f}")
+print(f"Safety events:   {len(report.safety_events)}")
+
+# Save reports
+ReporterFactory.get("html").save(report, "report.html")
+ReporterFactory.get("json").save(report, "results.json")
+```
+
+---
+
+## Quickstart (CLI)
+
+**Evaluate a corpus against a config file:**
+
+```bash
+ragprobe eval --config config.yaml --output results.json
+```
+
+Sample output:
+```
+✓ eval complete — 3 queries, 2 findings (0 CRITICAL, 1 WARNING, 1 INFO)
+```
+
+**Scan a corpus directory for injection patterns:**
+
+```bash
+ragprobe scan --corpus ./docs/
+# With a specific query for coverage analysis:
+ragprobe scan --corpus ./docs/ --query "What was Apple revenue in FY2024?"
+# Fail the pipeline if injection is found (useful in CI):
+ragprobe scan --corpus ./docs/ --raise-on-injection
+```
+
+Sample output:
+```
+✓ scan complete — 42 documents, 1 flagged, 1 blocked
+```
+
+**Generate an HTML or JSON report from saved results:**
+
+```bash
+ragprobe report --input results.json --format html --output report.html
+ragprobe report --input results.json --format json
+```
+
+---
+
+## What ragprobe checks
+
+| Concern | What it detects | Class |
+| --- | --- | --- |
+| **Safety** | Prompt injection patterns in corpus documents (20+ regex patterns: instruction overrides, persona hijacking, jailbreak keywords, delimiter injection) | `SafetyGate`, `InjectionGuard` |
+| **Retrieval quality** | Low context recall, redundant chunks (high pairwise Jaccard overlap), coverage gaps (query terms absent from all retrieved chunks), chunk length anomalies | `RetrievalDiagnostic`, `ChunkAnalyzer`, `ContextRecallScorer` |
+| **Cost** | Token usage tracking and USD budget enforcement across model calls | `SafetyGate` (via `CostGuard`) |
+| **Input validation** | Malformed queries, empty or non-printable documents, type errors before they reach your LLM | `SafetyGate` (via `InputValidator`) |
+
+---
+
+## Architecture
+
+```
+                   ┌──────────────┐
+   raw corpus ────►│  SafetyGate  │── injection events ──► safety_events[]
+                   │  (validate + │
+   raw queries ───►│   scan)      │── clean corpus
+                   └──────┬───────┘
+                          │ clean corpus
+                          ▼
+                   ┌──────────────┐
+                   │   Evaluator  │◄── top_k_retrieve() per query
+                   │  (orchestr.) │
+                   └──────┬───────┘
+                          │ queries + chunks
+                          ▼
+                   ┌──────────────────┐
+                   │ RetrievalDiag.   │── recall, redundancy,
+                   │ run()            │   coverage, findings
+                   └──────┬───────────┘
+                          │
+                          ▼
+                   ┌──────────────┐
+                   │ SessionReport│── save() ──► results.json
+                   └──────┬───────┘
+                          │
+                          ▼
+                   ┌──────────────┐
+                   │   Reporter   │── HTML / JSON / Markdown
+                   │  Factory     │
+                   └──────────────┘
+```
+
+---
+
+## Configuration (config.yaml)
+
+```yaml
+# Model used for cost estimation in the report
+model: gpt-4o-mini
+
+# USD spend budget — evaluation aborts if exceeded (optional)
+budget_usd: 2.0
+
+# Number of chunks to retrieve per query
+top_k: 5
+
+# Set true to compute semantic recall via embeddings (requires ragprobe[openai])
+semantic_recall: false
+
+# Queries to evaluate against the corpus
+queries:
+  - "What was Apple total revenue in fiscal year 2024?"
+  - "How did NVIDIA gross margin change year over year?"
+  - "What was Microsoft cloud revenue in FY2024?"
+
+# Path to directory of .txt corpus files
+corpus_dir: ./docs
+
+# Optional ground-truth reference answers (one per query, same order).
+# When provided, recall scores are computed. Omit to skip recall scoring.
+references:
+  - "Apple revenue was $391B in FY2024, up 4% year over year."
+  - "NVIDIA gross margin expanded from 57% in FY2023 to 73% in FY2024."
+  - "Microsoft cloud revenue was $135B in FY2024 with Azure growing 29%."
+```
+
+---
+
+## Findings severity levels
+
+| Severity | Trigger | What to do |
+| --- | --- | --- |
+| **CRITICAL** | Mean context recall < 30%, or mean chunk redundancy > 60% | Increase `top_k`, re-index with a domain-specific embedding model, or apply Maximum Marginal Relevance (MMR) reranking to diversify results |
+| **WARNING** | Mean recall 30–50%, or >50% of meaningful query terms missing from retrieved chunks | Add a cross-encoder re-ranker, increase chunk overlap, or add BM25 alongside dense retrieval (hybrid search) |
+| **INFO** | Mean chunk length below 80 words or above 600 words | Adjust chunking strategy — target 150–400 words per chunk for most RAG use cases to avoid splitting answers across boundaries |
 
 ---
 
 ## Contributing
 
-PRs welcome. If you find a failure mode this doesn't catch, open an issue.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for full details.
+
+**Quick start for contributors:**
+
+```bash
+git clone https://github.com/rohanvinayaksagvekar/ragprobe.git
+cd ragprobe
+pip install -e ".[dev]"
+pytest tests/ -v
+python demo.py
+```
 
 ---
 
-Apache-2.0 License
+## License
+
+Apache 2.0 — see [LICENSE](LICENSE).
