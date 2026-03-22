@@ -14,3 +14,4 @@ venv/
 examples/sec_eval_results.json
 demo_report.html
 demo_results.json
+pypirc.template
