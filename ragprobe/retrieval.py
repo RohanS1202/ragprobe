@@ -24,27 +24,12 @@ from __future__ import annotations
 
 import logging
 import math
-import re
 import statistics as _stats
 from typing import Any, Optional
 
-logger = logging.getLogger(__name__)
+from ragprobe._utils import _STOPWORDS, tokenize_ordered as _sig_tokens
 
-# ── Stopwords ─────────────────────────────────────────────────────────────────
-_STOPWORDS: frozenset[str] = frozenset({
-    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
-    "have", "has", "had", "do", "does", "did", "will", "would", "could",
-    "should", "may", "might", "shall", "can", "to", "of", "in", "for",
-    "on", "with", "at", "by", "from", "as", "or", "and", "but", "if",
-    "this", "that", "it", "its", "not", "no", "so", "what", "which",
-    "who", "how", "when", "where", "why", "i", "we", "you", "he", "she",
-    "they", "me", "us", "him", "her", "them", "my", "your", "his", "their",
-    "our", "than", "then", "there", "here", "up", "about", "any", "all",
-    "each", "few", "more", "most", "some", "such", "other", "both", "nor",
-    "neither", "either", "these", "those", "also", "into", "over", "after",
-    "between", "during", "before", "under", "while", "per", "only", "just",
-    "very", "too", "so", "yet", "still", "already", "even",
-})
+logger = logging.getLogger(__name__)
 
 # ── Severity thresholds ───────────────────────────────────────────────────────
 _RECALL_CRITICAL     = 0.3
@@ -58,14 +43,6 @@ _LONG_CHUNK_WORDS  = 600
 
 
 # ── Private helpers ───────────────────────────────────────────────────────────
-
-def _sig_tokens(text: str) -> list[str]:
-    """Return lowercase tokens of length >= 2 that are not stopwords."""
-    return [
-        t for t in re.findall(r"[a-z0-9]+", text.lower())
-        if len(t) >= 2 and t not in _STOPWORDS
-    ]
-
 
 def _sig_token_set(text: str) -> set[str]:
     return set(_sig_tokens(text))

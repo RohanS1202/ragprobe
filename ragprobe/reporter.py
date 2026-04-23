@@ -24,8 +24,10 @@ Usage::
 
 from __future__ import annotations
 
+import csv
 import datetime
 import html as _html
+import io
 import json
 import logging
 import uuid
@@ -767,3 +769,177 @@ class ReporterFactory:
                 f"Valid options: {valid}"
             )
         return cls()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Probe session reporters (spec §H)
+# Separate from the retrieval-diagnostic SessionReport above.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _reports_dir() -> Path:
+    """Return the ``./reports/`` directory, creating it if necessary."""
+    from ragprobe.config import REPORTS_DIR
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    return REPORTS_DIR
+
+
+def generate_probe_reports(session_id: str) -> dict[str, Path]:
+    """
+    Generate all three report files for a probe session.
+
+    Writes to ``./reports/``:
+      - ``report_{session_id}.json``   — full structured output
+      - ``report_{session_id}.csv``    — flat tabular export
+      - ``summary_{session_id}.txt``   — human-readable plain-text summary
+
+    Parameters
+    ----------
+    session_id : str
+        Session ID from a completed ``run_session()`` call.
+
+    Returns
+    -------
+    dict[str, Path]
+        Mapping of ``{"json": path, "csv": path, "txt": path}``.
+
+    Raises
+    ------
+    ValueError
+        If no session with ``session_id`` exists in the database.
+    """
+    from ragprobe.db import get_session_summary, get_all_results
+
+    session = get_session_summary(session_id)
+    if session is None:
+        raise ValueError(f"No session found with id: {session_id!r}")
+
+    results = get_all_results(session_id)
+    out_dir = _reports_dir()
+
+    json_path = out_dir / f"report_{session_id}.json"
+    csv_path  = out_dir / f"report_{session_id}.csv"
+    txt_path  = out_dir / f"summary_{session_id}.txt"
+
+    _write_probe_json(session, results, json_path)
+    _write_probe_csv(results, csv_path)
+    _write_probe_summary(session, results, txt_path)
+
+    logger.debug("Reports written to %s", out_dir)
+    return {"json": json_path, "csv": csv_path, "txt": txt_path}
+
+
+def _write_probe_json(session: dict, results: list[dict], path: Path) -> None:
+    """Write full structured JSON report for a probe session."""
+    data = {"session": session, "probe_results": results}
+    path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+
+
+def _write_probe_csv(results: list[dict], path: Path) -> None:
+    """Write flat CSV export of all probe results."""
+    if not results:
+        path.write_text("", encoding="utf-8")
+        return
+
+    fieldnames = [
+        "id", "session_id", "prompt_category", "prompt_text", "response_text",
+        "faithfulness", "relevance", "context_recall",
+        "injection_compliance", "confidentiality_violation", "refusal_evasion",
+        "latency_ms", "created_at",
+    ]
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for row in results:
+        writer.writerow(row)
+
+    path.write_text(buf.getvalue(), encoding="utf-8")
+
+
+def _write_probe_summary(session: dict, results: list[dict], path: Path) -> None:
+    """Write human-readable plain-text summary for a probe session."""
+    from ragprobe.config import FAITHFULNESS_THRESHOLD
+
+    session_id   = session.get("session_id", "unknown")
+    timestamp    = session.get("run_timestamp", "unknown")
+    mode         = session.get("pipeline_mode", "unknown")
+    total_probes = session.get("total_probes", len(results))
+    mean_faith   = session.get("mean_faithfulness")   or 0.0
+    mean_rel     = session.get("mean_relevance")      or 0.0
+    mean_ctx     = session.get("mean_context_recall") or 0.0
+
+    # Per-category failure rates (faithfulness < threshold = fail)
+    cat_totals:   dict[str, int] = {}
+    cat_failures: dict[str, int] = {}
+    safety_counts = {
+        "injection_compliance":      0,
+        "confidentiality_violation": 0,
+        "refusal_evasion":           0,
+    }
+
+    for r in results:
+        cat = r.get("prompt_category", "unknown")
+        cat_totals[cat]   = cat_totals.get(cat, 0) + 1
+        faith = r.get("faithfulness") or 0.0
+        if faith < FAITHFULNESS_THRESHOLD:
+            cat_failures[cat] = cat_failures.get(cat, 0) + 1
+        for flag in safety_counts:
+            if r.get(flag):
+                safety_counts[flag] += 1
+
+    if mean_faith >= FAITHFULNESS_THRESHOLD:
+        verdict = "PASS"
+        verdict_note = (
+            "All adversarial probes passed the faithfulness threshold. "
+            "The pipeline is resistant to the tested attack categories."
+        )
+    else:
+        verdict = "REJECT"
+        verdict_note = (
+            "One or more adversarial probes found faithfulness failures. "
+            "Review the per-category breakdown above to identify weak spots. "
+            "A REJECT verdict means the framework found real failure modes — "
+            "this is the tool working correctly, not a broken system."
+        )
+
+    lines = [
+        "ragprobe probe session summary",
+        "=" * 50,
+        f"Session ID    : {session_id}",
+        f"Timestamp     : {timestamp}",
+        f"Pipeline mode : {mode}",
+        f"Total probes  : {total_probes}",
+        "",
+        "Mean scores",
+        "-" * 30,
+        f"  Faithfulness    : {mean_faith:.3f}",
+        f"  Relevance       : {mean_rel:.3f}",
+        f"  Context recall  : {mean_ctx:.3f}",
+        "",
+        f"Per-category failure rates  (faithfulness < {FAITHFULNESS_THRESHOLD} = fail)",
+        "-" * 50,
+    ]
+
+    for cat in sorted(cat_totals):
+        total = cat_totals[cat]
+        fails = cat_failures.get(cat, 0)
+        pct   = (fails / total * 100) if total > 0 else 0.0
+        lines.append(f"  {cat:<26} {fails:>3}/{total:<3}  ({pct:.0f}% failure)")
+
+    lines += [
+        "",
+        "Safety flag counts",
+        "-" * 30,
+        f"  injection_compliance      : {safety_counts['injection_compliance']}",
+        f"  confidentiality_violation : {safety_counts['confidentiality_violation']}",
+        f"  refusal_evasion           : {safety_counts['refusal_evasion']}",
+        "",
+        "=" * 50,
+        f"Verdict : {verdict}",
+        f"  {verdict_note}",
+        f"  (PASS if mean faithfulness >= {FAITHFULNESS_THRESHOLD}, "
+        f"REJECT otherwise)",
+        "",
+    ]
+
+    path.write_text("\n".join(lines), encoding="utf-8")

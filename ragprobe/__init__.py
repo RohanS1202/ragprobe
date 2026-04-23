@@ -25,6 +25,7 @@ from ragprobe.evaluator import Evaluator
 from ragprobe.safety import SafetyGate
 from ragprobe.retrieval import RetrievalDiagnostic
 from ragprobe.reporter import SessionReport, ReporterFactory
+from ragprobe.rag_evaluator import RAGEvaluator
 
 __all__ = [
     # Primary public API
@@ -33,5 +34,7 @@ __all__ = [
     "RetrievalDiagnostic",
     "SessionReport",
     "ReporterFactory",
+    # Adversarial evaluation facade
+    "RAGEvaluator",
     "__version__",
 ]

@@ -103,13 +103,13 @@ def main():
     # Check for API key
     from dotenv import load_dotenv
     load_dotenv()
-    if not os.getenv("OPENAI_API_KEY") and not os.getenv("API_KEY"):
+    if not os.getenv("OPENAI_API_KEY") and not os.getenv("API_KEY") and not os.getenv("ANTHROPIC_API_KEY"):
         print("\nError: No API key found.")
-        print("Create a .env file with: OPENAI_API_KEY=sk-your-key-here")
+        print("Create a .env file with: ANTHROPIC_API_KEY=sk-ant-...")
         return
 
     print("\nInitialising evaluator...")
-    evaluator = RAGEvaluator(judge="openai")
+    evaluator = RAGEvaluator(judge="anthropic")
 
     # Step 1: generate adversarial test cases
     print("\nStep 1: Generating adversarial test cases from HR policy docs...")

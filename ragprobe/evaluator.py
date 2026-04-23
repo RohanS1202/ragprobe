@@ -10,7 +10,7 @@ Usage::
 
     gate       = SafetyGate.default(budget_usd=1.0)
     diagnostic = RetrievalDiagnostic()
-    evaluator  = Evaluator(gate=gate, diagnostic=diagnostic, model="gpt-4o-mini")
+    evaluator  = Evaluator(gate=gate, diagnostic=diagnostic, model="claude-haiku-4-5-20251001")
 
     report = evaluator.run(
         queries   = ["What was Apple revenue in FY2024?"],
@@ -23,10 +23,10 @@ Usage::
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from ragprobe._utils import _STOPWORDS, tokenize as _tokenize
 from ragprobe.safety import SafetyGate
 from ragprobe.retrieval import RetrievalDiagnostic
 from ragprobe.reporter import SessionReport
@@ -38,30 +38,6 @@ logger = logging.getLogger(__name__)
 
 # ── Exceptions caught as safety events (never allowed to crash a run) ─────────
 _SAFETY_EXCEPTIONS = (BudgetExceededError, RateLimitExceededError, InjectionDetectedError)
-
-# ── Stopwords (same set as retrieval.py — kept local to avoid coupling) ───────
-_STOPWORDS: frozenset[str] = frozenset({
-    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
-    "have", "has", "had", "do", "does", "did", "will", "would", "could",
-    "should", "may", "might", "shall", "can", "to", "of", "in", "for",
-    "on", "with", "at", "by", "from", "as", "or", "and", "but", "if",
-    "this", "that", "it", "its", "not", "no", "so", "what", "which",
-    "who", "how", "when", "where", "why", "i", "we", "you", "he", "she",
-    "they", "me", "us", "him", "her", "them", "my", "your", "his", "their",
-    "our", "than", "then", "there", "here", "up", "about", "any", "all",
-    "each", "few", "more", "most", "some", "such", "other", "both", "nor",
-    "neither", "either", "these", "those", "also", "into", "over", "after",
-    "between", "during", "before", "under", "while", "per", "only", "just",
-    "very", "too", "yet", "still", "already", "even",
-})
-
-
-def _tokenize(text: str) -> set[str]:
-    """Significant token set: lowercase, length >= 2, not a stopword."""
-    return {
-        t for t in re.findall(r"[a-z0-9]+", text.lower())
-        if len(t) >= 2 and t not in _STOPWORDS
-    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -81,7 +57,7 @@ class Evaluator:
         Diagnostic engine used for recall, redundancy, and coverage scoring.
     model : str
         LLM model name recorded in the output SessionReport and used for cost
-        estimation.  Default: ``"gpt-4o-mini"``.
+        estimation.  Default: ``"claude-haiku-4-5-20251001"``.
 
     Usage::
 
@@ -94,7 +70,7 @@ class Evaluator:
 
     gate:       SafetyGate
     diagnostic: RetrievalDiagnostic
-    model:      str = "gpt-4o-mini"
+    model:      str = "claude-haiku-4-5-20251001"
 
     # ── Public API ────────────────────────────────────────────────────────────
 

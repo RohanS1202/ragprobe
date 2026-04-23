@@ -128,7 +128,7 @@ class TestGenerator:
 
     _DEFAULTS = {
         "openai":    "gpt-4o-mini",
-        "anthropic": "claude-3-5-haiku-20241022",
+        "anthropic": "claude-haiku-4-5-20251001",
     }
 
     def __init__(

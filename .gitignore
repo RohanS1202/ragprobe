@@ -15,3 +15,14 @@ examples/sec_eval_results.json
 demo_report.html
 demo_results.json
 pypirc.template
+kb_out/
+ragprobe/kb_out/
+.claude/
+
+# Generated data / local indices
+faiss_index*/
+sec_edgar_filings/
+
+# Generated reports and evaluation outputs
+reports/
+examples/sec_eval_results.json

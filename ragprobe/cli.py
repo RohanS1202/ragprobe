@@ -22,6 +22,8 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
+from ragprobe.evaluator import Evaluator
+
 logger = logging.getLogger(__name__)
 
 
@@ -76,35 +78,6 @@ def _load_corpus(corpus_dir: str | Path) -> list[str]:
     return docs
 
 
-def _retrieve(query: str, corpus: list[str], k: int = 5) -> list[str]:
-    """
-    Simple lexical retrieval: return the top-k corpus chunks most relevant
-    to *query* by non-stopword token overlap.
-    """
-    if not corpus:
-        return []
-    _sw = {
-        "a", "an", "the", "is", "are", "was", "were", "be", "been",
-        "have", "has", "had", "do", "does", "did", "will", "would",
-        "could", "should", "may", "might", "to", "of", "in", "for",
-        "on", "with", "at", "by", "from", "as", "or", "and", "but",
-        "if", "this", "that", "it", "its", "not", "no", "what", "how",
-        "when", "where", "who", "i", "we", "you", "he", "she", "they",
-    }
-    q_tokens = {
-        t for t in re.findall(r"[a-z0-9]+", query.lower())
-        if len(t) >= 2 and t not in _sw
-    }
-    if not q_tokens:
-        return corpus[:k]
-    scores = [
-        len(q_tokens & set(re.findall(r"[a-z0-9]+", c.lower()))) / len(q_tokens)
-        for c in corpus
-    ]
-    ranked = sorted(range(len(corpus)), key=lambda i: scores[i], reverse=True)
-    return [corpus[i] for i in ranked[:k]]
-
-
 def _write_json(data: Any, path: str | Path) -> None:
     out = Path(path)
     try:
@@ -151,7 +124,7 @@ def _cmd_eval(args: argparse.Namespace) -> None:
         _die("all corpus documents were blocked by the safety gate")
 
     # ── Retrieval diagnostic ───────────────────────────────────────────────────
-    chunks_per_query = [_retrieve(q, clean_corpus, top_k) for q in queries]
+    chunks_per_query = [Evaluator.top_k_retrieve(q, clean_corpus, top_k) for q in queries]
 
     diag = RetrievalDiagnostic()
 
@@ -513,13 +486,251 @@ def _build_parser() -> _Parser:
         help="Write rendered report to this file (default: stdout).",
     )
 
+    # ── ingest ────────────────────────────────────────────────────────────────
+    p_ingest = sub.add_parser(
+        "ingest",
+        help="Fetch, parse, chunk, embed, and index 10-K filings from SEC EDGAR.",
+        description=(
+            "Download 10-K filings for the given tickers, chunk them at "
+            "~512 tokens, embed with text-embedding-3-small, and build a "
+            "FAISS flat L2 index.  Requires OPENAI_API_KEY for embeddings."
+        ),
+    )
+    p_ingest.add_argument(
+        "--tickers", nargs="+", required=True, metavar="TICKER",
+        help="Ticker symbols to ingest (e.g. AAPL MSFT AMZN).",
+    )
+    p_ingest.add_argument(
+        "--years", nargs="+", type=int, default=[2022, 2023, 2024], metavar="YEAR",
+        help="Fiscal years to include (default: 2022 2023 2024).",
+    )
+    p_ingest.add_argument(
+        "--index-dir", dest="index_dir", metavar="DIR", default=None,
+        help="Output directory for FAISS index (default: faiss_index/).",
+    )
+
+    # ── run ───────────────────────────────────────────────────────────────────
+    p_run = sub.add_parser(
+        "run",
+        help="Run the full adversarial probe suite against the RAG pipeline.",
+        description=(
+            "Load prompts.json, fire each prompt at the RAG pipeline, score "
+            "with the LLM judge and safety classifier, and persist all results "
+            "to SQLite.  Returns the session ID on completion."
+        ),
+    )
+    p_run.add_argument(
+        "--mode", choices=["baseline", "hardened"], default="baseline",
+        help="Pipeline mode (default: baseline).",
+    )
+    p_run.add_argument(
+        "--category", metavar="CAT", default=None,
+        help=(
+            "Run only this prompt category: hallucination_bait, "
+            "context_poisoning, temporal_confusion, prompt_injection, "
+            "out_of_scope."
+        ),
+    )
+    p_run.add_argument(
+        "--limit", type=int, metavar="N", default=None,
+        help="Stop after N probes (useful for smoke testing).",
+    )
+    p_run.add_argument(
+        "--no-llm-safety", dest="no_llm_safety", action="store_true",
+        help="Disable LLM fallback in safety classifier (keyword-only mode).",
+    )
+    p_run.add_argument(
+        "--faiss-path", dest="faiss_path", metavar="DIR", default=None,
+        help="FAISS index directory to use (default: faiss_index/).",
+    )
+
+    # ── probe-report (spec: ragprobe report --session) ────────────────────────
+    p_probe_report = sub.add_parser(
+        "probe-report",
+        help="Generate JSON/CSV/text reports for a probe session.",
+        description=(
+            "Pull a completed session from SQLite and write three files to "
+            "./reports/: report_<session>.json, report_<session>.csv, "
+            "summary_<session>.txt."
+        ),
+    )
+    p_probe_report.add_argument(
+        "--session", required=True, metavar="SESSION_ID",
+        help="Session ID returned by 'ragprobe run'.",
+    )
+
+    # ── compare ───────────────────────────────────────────────────────────────
+    p_compare = sub.add_parser(
+        "compare",
+        help="Compare two probe sessions side by side.",
+        description=(
+            "Pull results for both sessions from SQLite and print a "
+            "side-by-side comparison of mean scores, failure rates, and "
+            "safety flags.  Exports a CSV to ./reports/."
+        ),
+    )
+    p_compare.add_argument(
+        "--session-a", dest="session_a", required=True, metavar="SESSION_ID",
+        help="Reference session ID.",
+    )
+    p_compare.add_argument(
+        "--session-b", dest="session_b", required=True, metavar="SESSION_ID",
+        help="Comparison session ID.",
+    )
+
+    # ── generate-prompts ──────────────────────────────────────────────────────
+    p_gen = sub.add_parser(
+        "generate-prompts",
+        help="Auto-generate additional adversarial prompts for a category.",
+        description=(
+            "Use Claude to generate N new adversarial prompts for the given "
+            "category and optionally append them to prompts.json."
+        ),
+    )
+    p_gen.add_argument(
+        "--category", required=True, metavar="CAT",
+        help=(
+            "Target category: hallucination_bait, context_poisoning, "
+            "temporal_confusion, prompt_injection, out_of_scope."
+        ),
+    )
+    p_gen.add_argument(
+        "--n", type=int, default=10, metavar="N",
+        help="Number of prompts to generate (default: 10).",
+    )
+    p_gen.add_argument(
+        "--append", action="store_true",
+        help="Append generated prompts to prompts.json.",
+    )
+
+    # ── db-summary ────────────────────────────────────────────────────────────
+    sub.add_parser(
+        "db-summary",
+        help="Print a summary of all sessions in the SQLite store.",
+        description="List all probe sessions with their run timestamps and aggregate stats.",
+    )
+
     return parser
+
+
+# ── New sub-command handlers ──────────────────────────────────────────────────
+
+def _cmd_ingest(args: argparse.Namespace) -> None:
+    """Handler for ``ragprobe ingest``."""
+    from ragprobe.ingest import build_index
+    from ragprobe.config import FAISS_PATH
+    from pathlib import Path
+
+    index_dir = Path(args.index_dir) if args.index_dir else FAISS_PATH
+    tickers   = [t.upper() for t in args.tickers]
+
+    print(f"Ingesting tickers={tickers} years={args.years} → {index_dir}")
+    result = build_index(tickers=tickers, years=args.years, index_dir=index_dir)
+    _ok(
+        f"ingest complete — {result['total_chunks']} chunks indexed "
+        f"→ {result['index_dir']}"
+    )
+
+
+def _cmd_run(args: argparse.Namespace) -> None:
+    """Handler for ``ragprobe run``."""
+    from pathlib import Path
+    from ragprobe.probe_engine import run_session
+    from ragprobe.config import FAISS_PATH
+
+    faiss_path = Path(args.faiss_path) if args.faiss_path else FAISS_PATH
+
+    print(
+        f"Starting probe run: mode={args.mode}"
+        + (f" category={args.category}" if args.category else "")
+        + (f" limit={args.limit}" if args.limit else "")
+        + (f" faiss={faiss_path}" if args.faiss_path else "")
+    )
+
+    session_id = run_session(
+        mode            = args.mode,
+        category        = args.category,
+        limit           = args.limit,
+        use_llm_safety  = not args.no_llm_safety,
+        faiss_path      = faiss_path,
+    )
+
+    _ok(f"probe run complete — session_id={session_id}")
+    print(f"  → run 'ragprobe probe-report --session {session_id}' to generate reports")
+
+
+def _cmd_probe_report(args: argparse.Namespace) -> None:
+    """Handler for ``ragprobe probe-report``."""
+    from ragprobe.reporter import generate_probe_reports
+
+    print(f"Generating reports for session: {args.session}")
+    paths = generate_probe_reports(args.session)
+    _ok("reports written:")
+    for fmt, path in paths.items():
+        print(f"  [{fmt:4s}] {path}")
+
+
+def _cmd_compare(args: argparse.Namespace) -> None:
+    """Handler for ``ragprobe compare``."""
+    from ragprobe.compare import compare_sessions
+
+    compare_sessions(args.session_a, args.session_b)
+
+
+def _cmd_generate_prompts(args: argparse.Namespace) -> None:
+    """Handler for ``ragprobe generate-prompts``."""
+    from ragprobe.prompts import generate_prompts
+
+    print(f"Generating {args.n} prompts for category={args.category!r}…")
+    prompts = generate_prompts(
+        category        = args.category,
+        n               = args.n,
+        append_to_file  = args.append,
+    )
+    _ok(f"generated {len(prompts)} prompts")
+    for i, p in enumerate(prompts, 1):
+        print(f"\n  [{i}] {p['prompt_text'][:100]}")
+    if args.append:
+        print("\n  → Appended to prompts.json")
+
+
+def _cmd_db_summary(args: argparse.Namespace) -> None:  # noqa: ARG001
+    """Handler for ``ragprobe db-summary``."""
+    from ragprobe.db import init_db, list_sessions
+    from ragprobe.config import DB_PATH
+
+    init_db()
+    sessions = list_sessions()
+
+    if not sessions:
+        print("No sessions found in the database.")
+        return
+
+    print(f"\n{'Session ID':<40}  {'Timestamp':<24}  {'Mode':<10}  "
+          f"{'Probes':>6}  {'Faith':>6}  {'Rel':>6}  {'Ctx':>6}")
+    print("-" * 110)
+    for s in sessions:
+        faith = f"{s['mean_faithfulness']:.3f}"   if s["mean_faithfulness"]   is not None else "  N/A"
+        rel   = f"{s['mean_relevance']:.3f}"      if s["mean_relevance"]      is not None else "  N/A"
+        ctx   = f"{s['mean_context_recall']:.3f}" if s["mean_context_recall"] is not None else "  N/A"
+        print(
+            f"{s['session_id']:<40}  {s['run_timestamp']:<24}  "
+            f"{s['pipeline_mode']:<10}  {s['total_probes']:>6}  "
+            f"{faith:>6}  {rel:>6}  {ctx:>6}"
+        )
+    print(f"\n{len(sessions)} session(s) in {DB_PATH}\n")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
     """Main entry point for the ragprobe CLI."""
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+
     parser = _build_parser()
     args   = parser.parse_args()
 
@@ -538,6 +749,18 @@ def main() -> None:
             _cmd_scan(args)
         elif args.command == "report":
             _cmd_report(args)
+        elif args.command == "ingest":
+            _cmd_ingest(args)
+        elif args.command == "run":
+            _cmd_run(args)
+        elif args.command == "probe-report":
+            _cmd_probe_report(args)
+        elif args.command == "compare":
+            _cmd_compare(args)
+        elif args.command == "generate-prompts":
+            _cmd_generate_prompts(args)
+        elif args.command == "db-summary":
+            _cmd_db_summary(args)
     except SystemExit:
         raise
     except KeyboardInterrupt:
